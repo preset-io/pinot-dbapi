@@ -1,0 +1,10 @@
+{
+  "schemaName": "resultTypes",
+  "dimensionFieldSpecs": [
+    {"name": "id", "dataType": "INT"},
+    {"name": "amount", "dataType": "BIG_DECIMAL"},
+    {"name": "payload", "dataType": "BYTES"},
+    {"name": "tags", "dataType": "STRING", "singleValueField": false},
+    {"name": "numbers", "dataType": "INT", "singleValueField": false}
+  ]
+}

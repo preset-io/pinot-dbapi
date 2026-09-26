@@ -4,6 +4,22 @@ This module allows accessing Pinot via its [SQL API](https://docs.pinot.apache.o
 
 Current supported Pinot version: `1.1.0`.
 
+## Result types
+
+`BIG_DECIMAL` broker strings are decoded as `decimal.Decimal`, preserving
+precision and scale, and `BYTES` hexadecimal strings as `bytes` (including
+empty bytes). SQL nulls remain `None`; default-value sentinels from tables
+without null handling are not reinterpreted as nulls. These decoded types also
+apply to untyped DB-API queries. Code that previously consumed hex strings
+should use `value.hex()` explicitly.
+
+SQLAlchemy reflection represents `singleValueField: false` as a one-dimensional
+`ARRAY` with its scalar item type. Reflected decimal results do not pass through
+float conversion; `Numeric(asdecimal=False)` explicitly requests floats.
+
+For the opt-in live regression, see
+[the fixture instructions](tests/integration/fixtures/result_types/README.md).
+
 ## Usage
 
 ### Using the DB API to query Pinot Broker directly:

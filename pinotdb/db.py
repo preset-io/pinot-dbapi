@@ -1,5 +1,6 @@
 import asyncio
 from functools import wraps
+from decimal import Decimal
 from typing import Any
 
 import ciso8601
@@ -32,6 +33,7 @@ class Type(Enum):
     BOOLEAN = 3
     TIMESTAMP = 4
     JSON = 5
+    BINARY = 6
 
 
 def connect(*args, **kwargs):
@@ -122,8 +124,10 @@ TypeCodeAndValue = namedtuple(
 def get_types_from_column_data_types(column_data_types):
     types = [None] * len(column_data_types)
     for column_index, column_data_type in enumerate(column_data_types):
-        data_type = column_data_type.split("_")[0]
-        is_iterable = "_ARRAY" in column_data_type
+        is_iterable = column_data_type.endswith("_ARRAY")
+        data_type = (
+            column_data_type[:-6] if is_iterable else column_data_type
+        )
         if (
             data_type == "INT"
             or data_type == "LONG"
@@ -132,7 +136,13 @@ def get_types_from_column_data_types(column_data_types):
         ):
             types[column_index] = TypeCodeAndValue(
                 Type.NUMBER, is_iterable, False)
-        elif data_type == "STRING" or data_type == "BYTES":
+        elif data_type == "BIG_DECIMAL":
+            types[column_index] = TypeCodeAndValue(
+                Type.NUMBER, is_iterable, True)
+        elif data_type == "BYTES":
+            types[column_index] = TypeCodeAndValue(
+                Type.BINARY, is_iterable, True)
+        elif data_type == "STRING":
             types[column_index] = TypeCodeAndValue(
                 Type.STRING, is_iterable, False)
         elif data_type == "BOOLEAN":
@@ -290,7 +300,18 @@ def convert_result_if_required(data_types, rows):
 
 
 def convert_result(data_type, raw_row):
-    if data_type.code == Type.TIMESTAMP:
+    if raw_row is None:
+        return None
+    if data_type.is_iterable and data_type.code != Type.STRING:
+        scalar_type = data_type._replace(is_iterable=False)
+        return [convert_result(scalar_type, value) for value in raw_row]
+    if data_type.code == Type.NUMBER:
+        # BIG_DECIMAL is a decimal string, not a JSON-encoded string or float.
+        return Decimal(raw_row)
+    elif data_type.code == Type.BINARY:
+        # The broker serializes BYTES as hexadecimal, not text bytes.
+        return bytes.fromhex(raw_row)
+    elif data_type.code == Type.TIMESTAMP:
         # Pinot returns TIMESTAMP as STRING
         return ciso8601.parse_datetime(raw_row)
     elif data_type.code == Type.JSON:
