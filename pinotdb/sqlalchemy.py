@@ -1,4 +1,5 @@
 import collections
+from decimal import Decimal
 import sys
 from urllib import parse
 
@@ -18,6 +19,38 @@ import logging
 import json
 
 logger = logging.getLogger(__name__)
+
+
+class PinotNumeric(types.Numeric):
+    def result_processor(self, dialect, coltype):
+        fallback = super().result_processor(dialect, coltype)
+
+        def process(value):
+            # Preserve native BIG_DECIMAL precision and scale. DOUBLE still
+            # uses SQLAlchemy's existing float-to-decimal behavior.
+            if value is None:
+                return None
+            if isinstance(value, Decimal):
+                return value if self.asdecimal else float(value)
+            return fallback(value) if fallback else value
+
+        return process
+
+
+class PinotArray(types.ARRAY):
+    def result_processor(self, dialect, coltype):
+        item_processor = self.item_type.dialect_impl(dialect).result_processor(
+            dialect, coltype,
+        )
+
+        def process(value):
+            if value is None:
+                return None
+            items = (item_processor(item) if item_processor else item
+                     for item in value)
+            return tuple(items) if self.as_tuple else list(items)
+
+        return process
 
 
 class PinotCompiler(compiler.SQLCompiler):
@@ -347,6 +380,7 @@ class PinotDialect(default.DefaultDialect):
     preparer = PinotIdentifierPareparer
     statement_compiler = PinotCompiler
     type_compiler = PinotTypeCompiler
+    colspecs = {types.Numeric: PinotNumeric, types.ARRAY: PinotArray}
     supports_schemas = False
     supports_statement_cache = False
     supports_alter = False
@@ -529,7 +563,10 @@ class PinotDialect(default.DefaultDialect):
         columns = [
             {
                 "name": spec["name"],
-                "type": get_type(spec["dataType"], spec.get("fieldSize")),
+                "type": get_type(
+                    spec["dataType"], spec.get("fieldSize"),
+                    spec.get("singleValueField", True),
+                ),
                 "nullable": True,
                 "default": get_default(spec.get("defaultNullValue", "null")),
             }
@@ -659,7 +696,7 @@ def get_default(pinot_column_default):
 
 # Ref to supported Pinot data types:
 # https://docs.pinot.apache.org/basics/components/schema#data-types
-def get_type(data_type, field_size):
+def get_type(data_type, field_size, single_value=True):
     type_map = {
         "int": types.BigInteger,
         "long": types.BigInteger,
@@ -678,4 +715,7 @@ def get_type(data_type, field_size):
         "map": types.BLOB,
         "array": types.ARRAY,
     }
-    return type_map[data_type.lower()]
+    scalar_type = type_map[data_type.lower()]
+    if not single_value:
+        return types.ARRAY(scalar_type, dimensions=1)
+    return scalar_type

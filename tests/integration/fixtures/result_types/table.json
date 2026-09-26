@@ -1,0 +1,8 @@
+{
+  "tableName": "resultTypes",
+  "tableType": "OFFLINE",
+  "segmentsConfig": {"replication": "1", "schemaName": "resultTypes"},
+  "tenants": {"broker": "DefaultTenant", "server": "DefaultTenant"},
+  "tableIndexConfig": {"loadMode": "MMAP", "nullHandlingEnabled": true},
+  "metadata": {}
+}

@@ -1,0 +1,3 @@
+{"id":1,"amount":"123456789012345678901234567890.12345678901234567890","payload":"00ff8041","tags":["SJC","ABQ"],"numbers":[1,2]}
+{"id":2,"amount":null,"payload":null,"tags":["null-row"],"numbers":[0]}
+{"id":3,"amount":"-0.00000000000000000001","payload":"","tags":["empty-bytes"],"numbers":[-1]}
