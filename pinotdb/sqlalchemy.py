@@ -9,6 +9,7 @@ from sqlalchemy.engine import default
 from sqlalchemy.engine.interfaces import AdaptedConnection
 from sqlalchemy.sql import compiler
 from sqlalchemy import pool, types
+from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.util.concurrency import await_only
 
 import pinotdb
@@ -529,6 +530,18 @@ class PinotDialect(default.DefaultDialect):
             verify=self._verify_ssl,
             auth=auth,
         )
+        if r.status_code in (401, 403):
+            raise exceptions.OperationalError(
+                f"Pinot controller rejected the credentials for {path}: "
+                f"HTTP {r.status_code}"
+            )
+        if r.status_code >= 400:
+            error = exceptions.DatabaseError(
+                f"Pinot controller returned HTTP {r.status_code} for "
+                f"{path}: {r.text}"
+            )
+            error.status_code = r.status_code
+            raise error
         try:
             result = r.json()
         except ValueError as e:
@@ -569,9 +582,14 @@ class PinotDialect(default.DefaultDialect):
         return {}
 
     def get_columns(self, connection, table_name, schema=None, **kwargs):
-        payload = self.get_metadata_from_controller(
-            f"/tables/{table_name}/schema"
-        )
+        try:
+            payload = self.get_metadata_from_controller(
+                f"/tables/{table_name}/schema"
+            )
+        except exceptions.DatabaseError as e:
+            if getattr(e, "status_code", None) == 404:
+                raise NoSuchTableError(table_name) from e
+            raise
 
         logger.info(
             "Getting columns for %s from %s: %s",

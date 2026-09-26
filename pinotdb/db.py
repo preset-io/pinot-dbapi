@@ -561,6 +561,19 @@ class Cursor:
                 f"with the status code {status_code}:\n{payload}"
             )
 
+        # Raise HTTP errors before reading query stats: an error response
+        # carries no server counts, which would otherwise be misreported as
+        # a timeout.
+        if query_response.status_code != 200:
+            msg = (
+                f"Query\n\n{input_query}\n\nreturned an error: "
+                f"{query_response.status_code}\n"
+                f"Full response is {pformat(payload)}")
+            if query_response.status_code in (401, 403):
+                raise exceptions.OperationalError(
+                    "Pinot broker rejected the request credentials. " + msg)
+            raise exceptions.ProgrammingError(msg)
+
         self.query_stats = get_query_stats(payload)
         num_servers_responded = self.query_stats.get("numServersResponded", -1)
         num_servers_queried = self.query_stats.get("numServersQueried", -1)
@@ -569,14 +582,6 @@ class Cursor:
         self.check_sufficient_responded(
             input_query, num_servers_queried, num_servers_responded
         )
-
-        # raise any error messages
-        if query_response.status_code != 200:
-            msg = (
-                f"Query\n\n{input_query}\n\nreturned an error: "
-                f"{query_response.status_code}\n"
-                f"Full response is {pformat(payload)}")
-            raise exceptions.ProgrammingError(msg)
 
         query_exceptions = [
             e for e in payload.get("exceptions", [])
