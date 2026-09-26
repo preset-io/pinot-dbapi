@@ -11,7 +11,7 @@ from sqlalchemy.engine import default
 from sqlalchemy.engine.interfaces import AdaptedConnection
 from sqlalchemy.sql import compiler
 from sqlalchemy import pool, types
-from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy.exc import CompileError, NoSuchTableError
 from sqlalchemy.util.concurrency import await_only
 
 import pinotdb
@@ -44,7 +44,7 @@ def _binary_value(value):
     if isinstance(value, str):
         # Hex text, as the broker returns it and as BI tools display it.
         return bytes.fromhex(value)
-    return bytes(value)
+    return pinotdb.db.Binary(value)
 
 
 class PinotLargeBinary(types.LargeBinary):
@@ -107,6 +107,10 @@ class PinotCompiler(compiler.SQLCompiler):
         if self.preparer.omit_schema:
             kwargs["ambiguous_table_name_map"] = None
             self.pinot_databases.add(self.preparer.pinot_database_for(table))
+            if len(self.pinot_databases) > 1:
+                raise CompileError(
+                    "A Pinot statement cannot reference tables in more than "
+                    "one logical database")
         return super().visit_table(table, **kwargs)
 
     def visit_column(self, column, result_map=None, **kwargs):
@@ -512,9 +516,8 @@ class PinotDialect(default.DefaultDialect):
             kwargs["database"] = self._database = kwargs.pop("database")
         kwargs["debug"] = self._debug = pinotdb.db.as_bool(
             kwargs.get("debug", False), "debug")
-        kwargs["verify_ssl"] = self._verify_ssl = (
-            str(kwargs.get("verify_ssl", "true")).lower() in ['true']
-        )
+        kwargs["verify_ssl"] = self._verify_ssl = pinotdb.db.as_bool(
+            kwargs.get("verify_ssl", True), "verify_ssl")
         kwargs["timeout"] = self._timeout = (
             float(kwargs.get('timeout'))
             if kwargs.get('timeout')
@@ -638,14 +641,22 @@ class PinotDialect(default.DefaultDialect):
         # The database option is an explicit single-database mode.
         if self._database:
             return [self._database]
+        # Listing databases is best effort: without a controller, on servers
+        # before logical databases (no /databases endpoint), for principals
+        # without cluster-level database access, or when the controller cannot
+        # be reached, fall back to the default database, as before logical
+        # database support. A malformed 200 response still raises.
+        if not self._controller:
+            return ['default']
         try:
             databases = self.get_metadata_from_controller(
                 "/databases", database=None)
-        except exceptions.DatabaseError as e:
-            # Servers before logical databases have no /databases endpoint.
-            if getattr(e, "status_code", None) in (404, 405):
-                return ['default']
-            raise
+        except (exceptions.DatabaseError,
+                requests.exceptions.RequestException) as e:
+            logger.warning(
+                "Could not list Pinot databases from the controller, "
+                "listing only 'default': %s", e)
+            return ['default']
         if not isinstance(databases, list) or not all(
             isinstance(name, str) for name in databases
         ):

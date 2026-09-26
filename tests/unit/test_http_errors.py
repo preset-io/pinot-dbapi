@@ -29,6 +29,19 @@ def test_broker_auth_failure_is_operational_error_not_timeout(status):
     assert str(status) in str(info.value)
 
 
+@pytest.mark.parametrize('status', [401, 403])
+@pytest.mark.parametrize('body', [b'', b'<html>Forbidden</html>'])
+def test_broker_auth_failure_without_json_body_is_operational_error(
+    status, body,
+):
+    # A proxy or ingress in front of the broker may not answer with JSON.
+    cursor = Cursor(host='localhost', session=MagicMock(spec=httpx.Client))
+    response = httpx.Response(status, content=body)
+    with pytest.raises(exceptions.OperationalError) as info:
+        cursor.normalize_query_response('SELECT 1', response)
+    assert str(status) in str(info.value)
+
+
 def test_other_broker_http_errors_stay_programming_errors():
     with pytest.raises(exceptions.ProgrammingError) as info:
         broker_error(500, {'code': 500, 'error': 'boom'})

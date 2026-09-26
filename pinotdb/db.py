@@ -381,6 +381,8 @@ def _contains_float(value):
 def _decimals_to_floats(value):
     if isinstance(value, list):
         return [_decimals_to_floats(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _decimals_to_floats(item) for key, item in value.items()}
     return float(value) if isinstance(value, Decimal) else value
 
 
@@ -537,6 +539,19 @@ class Cursor:
             return {"sql": query}
 
     def normalize_query_response(self, input_query, query_response):
+        if query_response.status_code in (401, 403):
+            # Checked before parsing: a proxy in front of the broker may
+            # answer with an empty or HTML body.
+            self.raw_query_response = {
+                "response": query_response.text,
+                "status_code": query_response.status_code,
+            }
+            raise exceptions.OperationalError(
+                "Pinot broker rejected the request credentials. "
+                f"Query\n\n{input_query}\n\nreturned an error: "
+                f"{query_response.status_code}\n"
+                f"Full response is {query_response.text}")
+
         try:
             payload = query_response.json()
             self.raw_query_response = {
@@ -569,9 +584,6 @@ class Cursor:
                 f"Query\n\n{input_query}\n\nreturned an error: "
                 f"{query_response.status_code}\n"
                 f"Full response is {pformat(payload)}")
-            if query_response.status_code in (401, 403):
-                raise exceptions.OperationalError(
-                    "Pinot broker rejected the request credentials. " + msg)
             raise exceptions.ProgrammingError(msg)
 
         self.query_stats = get_query_stats(payload)
@@ -793,6 +805,9 @@ def apply_parameters(operation, parameters):
 
 def Binary(value):
     """PEP 249 constructor for a binary (BYTES) parameter."""
+    # bytes(3) would silently be three zero bytes.
+    if isinstance(value, int):
+        raise TypeError(f"Binary() needs a bytes-like value, not {value!r}")
     return bytes(value)
 
 

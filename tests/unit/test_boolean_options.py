@@ -41,6 +41,21 @@ def test_unrecognized_boolean_is_rejected(option):
 
 
 @pytest.mark.parametrize('value,expected', [
+    ('true', True), ('1', True), ('yes', True), (True, True),
+    ('false', False), ('0', False), ('no', False), (False, False),
+])
+def test_verify_ssl_is_parsed_like_the_other_options(value, expected):
+    # verify_ssl=1 or verify_ssl=yes used to disable TLS verification.
+    assert PinotDialect(verify_ssl=value)._verify_ssl is expected
+
+
+def test_verify_ssl_defaults_on_and_rejects_unknown_values():
+    assert PinotDialect()._verify_ssl is True
+    with pytest.raises(exceptions.InterfaceError):
+        PinotDialect(verify_ssl='maybe')
+
+
+@pytest.mark.parametrize('value,expected', [
     ('false', {'sql': 'SELECT 1'}),
     ('true', {'sql': 'SELECT 1',
               'queryOptions': 'useMultistageEngine=true'}),

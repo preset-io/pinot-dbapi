@@ -33,9 +33,12 @@ without float rounding. A value that cannot be decoded as its declared type
 raises `pinotdb.exceptions.DataError`.
 
 Boolean connection options (`use_multistage_engine`, `preserve_types`,
-`debug`) accept booleans or the strings `true`/`false`, `1`/`0`, `yes`/`no`,
-`on`/`off`, as they arrive from URL query strings; other values raise
-`InterfaceError` instead of being treated as enabled.
+`debug`, `verify_ssl`) accept booleans or the strings `true`/`false`, `1`/`0`,
+`yes`/`no`, `on`/`off`, as they arrive from URL query strings; other values
+raise `InterfaceError` instead of being treated as enabled. This is stricter
+than 9.1.2.2: values such as `'t'`, `'y'` or `1.0`, which used to count as
+true, are now rejected, and `verify_ssl=1`/`verify_ssl=yes` keep TLS
+verification on (they used to turn it off).
 
 For the opt-in live regression, see
 [the fixture instructions](tests/integration/fixtures/result_types/README.md).
@@ -266,8 +269,10 @@ If not specified the connection will use the `default` database context while qu
 Setting `database` is an explicit single-database mode: schema listing
 returns only that database. Without it, Pinot logical databases act as
 SQLAlchemy schemas:
-- `get_schema_names()` lists them from the controller's `/databases`
-  (`['default']` on servers without that endpoint);
+- `get_schema_names()` lists them from the controller's `/databases`; it
+  returns `['default']`, as before, when no controller is configured, the
+  server has no such endpoint, the credentials may not list databases, or
+  the controller cannot be reached;
 - `get_table_names`, `get_columns` and `has_table` with `schema='db2'` query
   that database;
 - a `Table(..., schema='db2')` compiles as `db2.table` (columns stay
@@ -275,7 +280,8 @@ SQLAlchemy schemas:
   which the multi-stage engine requires.
 
 Tables in the connection's own database (`default`, or the `database` option)
-stay unqualified. A single statement cannot mix databases.
+stay unqualified. A single statement cannot mix databases: compiling one
+that does raises `CompileError`.
 
 ## Examples with Pinot Quickstart
 

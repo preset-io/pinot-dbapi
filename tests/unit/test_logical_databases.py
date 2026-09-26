@@ -3,7 +3,9 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+import requests
 import responses
+from sqlalchemy.exc import CompileError
 from sqlalchemy import (
     Column, Integer, MetaData, Table, create_engine, select, text,
 )
@@ -37,13 +39,31 @@ def test_schema_names_fall_back_on_servers_without_databases():
 
 
 @responses.activate
-@pytest.mark.parametrize('body,status,error', [
-    ({'unexpected': True}, 200, exceptions.DatabaseError),
-    ({'code': 401}, 401, exceptions.OperationalError),
-])
-def test_schema_names_errors_are_not_hidden(body, status, error):
-    responses.get(CONTROLLER + 'databases', status=status, json=body)
-    with pytest.raises(error):
+@pytest.mark.parametrize('status', [401, 403, 405, 500, 503])
+def test_schema_names_fall_back_when_the_controller_refuses(status):
+    # Schema pickers must keep working for principals without cluster-level
+    # database access and when the controller fails.
+    responses.get(CONTROLLER + 'databases', status=status,
+                  json={'code': status})
+    assert dialect().get_schema_names(None) == ['default']
+
+
+@responses.activate
+def test_schema_names_fall_back_when_the_controller_is_unreachable():
+    responses.get(CONTROLLER + 'databases',
+                  body=requests.exceptions.ConnectionError('refused'))
+    assert dialect().get_schema_names(None) == ['default']
+
+
+def test_schema_names_without_a_controller_make_no_call():
+    assert PinotDialect().get_schema_names(None) == ['default']
+
+
+@responses.activate
+@pytest.mark.parametrize('body', [{'unexpected': True}, ['db2', 3]])
+def test_malformed_schema_names_are_not_hidden(body):
+    responses.get(CONTROLLER + 'databases', json=body)
+    with pytest.raises(exceptions.DatabaseError):
         dialect().get_schema_names(None)
 
 
@@ -97,10 +117,12 @@ def test_compiled_tables_are_qualified_and_routed(
     assert compiled.pinot_database == routed
 
 
-def test_statements_mixing_databases_are_not_routed():
-    a, b = table('db2'), table('db3')
-    compiled = select(a.c.id, b.c.id).compile(dialect=dialect())
-    assert compiled.pinot_database is None
+@pytest.mark.parametrize('first,second', [
+    ('db2', 'db3'), ('db2', None), (None, 'db2')])
+def test_statements_mixing_databases_do_not_compile(first, second):
+    a, b = table(first), table(second)
+    with pytest.raises(CompileError, match='more than one logical database'):
+        select(a.c.id, b.c.id).compile(dialect=dialect())
 
 
 def run(statement, url_query=''):

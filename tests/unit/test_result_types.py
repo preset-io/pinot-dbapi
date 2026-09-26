@@ -104,6 +104,15 @@ def test_big_decimal_json_number_keeps_exact_digits():
     assert type(cursor.query_stats['timeUsedMs']) is float
 
 
+def test_big_decimal_reparse_keeps_floats_inside_json_objects():
+    # The re-parse turns every JSON number into a Decimal; values inside
+    # objects must go back to floats like the rest of the response.
+    cursor = query(payload(['BIG_DECIMAL', 'MAP'], '[[1.5, {"a": 0.1}]]'))
+    row = cursor.fetchall()[0]
+    assert row[0] == Decimal('1.5')
+    assert json.loads(row[1]) == {'a': 0.1}
+
+
 def test_big_decimal_strings_are_not_reparsed():
     cursor = query(payload(
         ['BIG_DECIMAL', 'DOUBLE'], '[["1.000000000000000000001", 0.5]]'))
@@ -228,6 +237,18 @@ def test_pep249_binary_constructor():
     assert pinotdb.Binary(b'\x00A') == b'\x00A'
     assert apply_parameters('%(p)s', {'p': pinotdb.Binary(b'\x00')}) == (
         "hexToBytes('00')")
+
+
+@pytest.mark.parametrize('value', [3, 0, True])
+def test_binary_rejects_integers(value):
+    # bytes(3) would silently bind three zero bytes.
+    import pinotdb
+    with pytest.raises(TypeError):
+        pinotdb.Binary(value)
+    process = PinotDialect().type_descriptor(
+        types.LargeBinary()).bind_processor(PinotDialect())
+    with pytest.raises(TypeError):
+        process(value)
 
 
 def binary_statement(value, operator='eq'):
