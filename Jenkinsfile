@@ -19,7 +19,7 @@
 //
 //   * master      -> bare 9.1.2.1, guarded by an existence check so a
 //     published artifact is never overwritten.
-//   * PR branches -> 9.1.2.1+PR-<n>.<shortsha> (PEP 440 local version).
+//   * PR branches -> 9.1.2.1+pr.<n>.<shortsha> (PEP 440 local version).
 //
 // Note 9.1.2.1 sorts ABOVE upstream 9.1.2, so it must never be offered to a
 // dependency resolver as a candidate for the plain `pinotdb` name. Pinning the
@@ -125,22 +125,31 @@ podTemplate(
 
             stage('Package Release') {
                 if (env.BRANCH_NAME.startsWith("PR-")) {
-                    def pullRequestVersion = "${currentVersion}+${env.BRANCH_NAME}.${shortGitRev}"
+                    def pullRequestVersion = sh(
+                        script: "python scripts/release_version.py '${currentVersion}' '${env.BRANCH_NAME}' '${shortGitRev}'",
+                        returnStdout: true,
+                        label: 'Normalize PR version'
+                    ).trim()
                     sh(
                         script: "sed -i \"s/^version = \\\"${currentVersion}\\\"/version = \\\"${pullRequestVersion}\\\"/\" pyproject.toml",
                         label: 'Changing version for PR'
                     )
-                    sh(script: "echo PR version: ${pullRequestVersion}", label: 'PR Release candidate version')
+                    currentVersion = pullRequestVersion
+                    sh(script: "echo PR version: ${currentVersion}", label: 'PR Release candidate version')
                 }
                 sh(script: 'python -m pip install build && python -m build', label: 'Bundling release')
 
                 // Fail closed: the filename version, the sdist metadata version
                 // and the declared version must all agree, and the artifacts
                 // must not ship the top-level tests package.
-                sh(
-                    script: '''
+                withEnv(["RELEASE_VERSION=${currentVersion}"]) {
+                    sh(
+                        script: '''
                         set -eu
-                        EXPECTED="$(grep '^version' pyproject.toml | head -1 | cut -d'"' -f2)"
+                        EXPECTED="$RELEASE_VERSION"
+                        DECLARED="$(grep '^version' pyproject.toml | head -1 | cut -d'"' -f2)"
+                        test "$DECLARED" = "$EXPECTED" \
+                            || { echo "declared version ${DECLARED} != ${EXPECTED}"; exit 1; }
                         test -f "dist/pinotdb-${EXPECTED}.tar.gz" \
                             || { echo "missing sdist for ${EXPECTED}"; ls -1 dist; exit 1; }
                         test -f "dist/pinotdb-${EXPECTED}-py3-none-any.whl" \
@@ -154,12 +163,13 @@ podTemplate(
                             echo "sdist must not ship the tests package"; exit 1
                         fi
                         echo "artifact check OK: ${EXPECTED}"
-                        sha256sum dist/*.tar.gz dist/*.whl
+                        sha256sum "dist/pinotdb-${EXPECTED}.tar.gz" "dist/pinotdb-${EXPECTED}-py3-none-any.whl"
                     ''',
-                    label: 'Verify artifact contents'
-                )
+                        label: 'Verify artifact contents'
+                    )
+                }
 
-                sh(script: "mkdir -p dist/${LIB_NAME} && mv dist/*.gz dist/*.whl dist/${LIB_NAME}", label: 'Setup release folder')
+                sh(script: "mkdir -p dist/${LIB_NAME} && mv dist/${DIST_NAME}-${currentVersion}.tar.gz dist/${DIST_NAME}-${currentVersion}-py3-none-any.whl dist/${LIB_NAME}", label: 'Setup release folder')
             }
         }
 
