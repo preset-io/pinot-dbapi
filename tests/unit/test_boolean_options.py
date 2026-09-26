@@ -1,0 +1,67 @@
+"""String boolean options must not be enabled by Python truthiness."""
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
+from sqlalchemy.engine import make_url
+
+from pinotdb import connect, exceptions
+from pinotdb.db import Cursor
+from pinotdb.sqlalchemy import PinotDialect, PinotMultiStageDialect
+
+
+def payload(**options):
+    cursor = Cursor(host='localhost', session=MagicMock(spec=httpx.Client),
+                    **options)
+    return cursor.finalize_query_payload('SELECT 1')
+
+
+@pytest.mark.parametrize('value', ['false', 'False', '0', 'no', 'off', '',
+                                   False, 0, None])
+def test_false_strings_keep_single_stage_engine(value):
+    assert payload(use_multistage_engine=value) == {'sql': 'SELECT 1'}
+
+
+@pytest.mark.parametrize('value', ['true', 'TRUE', '1', 'yes', 'on', True, 1])
+def test_true_values_enable_multistage_engine(value):
+    assert payload(use_multistage_engine=value) == {
+        'sql': 'SELECT 1', 'queryOptions': 'useMultistageEngine=true'}
+
+
+@pytest.mark.parametrize('value', ['false', '0'])
+def test_false_preserve_types_string_adds_no_option(value):
+    assert payload(preserve_types=value) == {'sql': 'SELECT 1'}
+
+
+@pytest.mark.parametrize('option', [
+    'use_multistage_engine', 'preserve_types', 'debug'])
+def test_unrecognized_boolean_is_rejected(option):
+    with pytest.raises(exceptions.InterfaceError):
+        payload(**{option: 'maybe'})
+
+
+@pytest.mark.parametrize('value,expected', [
+    ('false', {'sql': 'SELECT 1'}),
+    ('true', {'sql': 'SELECT 1',
+              'queryOptions': 'useMultistageEngine=true'}),
+])
+def test_url_query_option_reaches_cursor(value, expected):
+    dialect = PinotDialect()
+    url = make_url(
+        'pinot://localhost:8000/query/sql?controller=http://localhost:9000/'
+        f'&use_multistage_engine={value}&debug=false')
+    _, kwargs = dialect.create_connect_args(url)
+    assert dialect._debug is False
+    connection = connect(session=MagicMock(spec=httpx.Client), **kwargs)
+    assert connection.use_multistage_engine is (value == 'true')
+    assert connection._debug is False
+    cursor = connection.cursor()
+    assert cursor.finalize_query_payload('SELECT 1') == expected
+
+
+def test_multistage_dialect_still_enables_engine():
+    _, kwargs = PinotMultiStageDialect().create_connect_args(make_url(
+        'pinot://localhost:8000/query/sql?controller=http://localhost:9000/'))
+    cursor = connect(session=MagicMock(spec=httpx.Client), **kwargs).cursor()
+    assert cursor.finalize_query_payload('SELECT 1')['queryOptions'] == (
+        'useMultistageEngine=true')

@@ -17,6 +17,21 @@ SQLAlchemy reflection represents `singleValueField: false` as a one-dimensional
 `ARRAY` with its scalar item type. Reflected decimal results do not pass through
 float conversion; `Numeric(asdecimal=False)` explicitly requests floats.
 
+Reflected types render as text through the dialect's type compiler: `BYTES`
+columns as `BYTES`, and multi-value columns as their scalar type name followed
+by ` ARRAY` (for example `VARCHAR ARRAY`, `NUMERIC ARRAY`). Tools that store
+reflected type names will see this suffix on multi-value columns where they
+previously saw only the scalar name; the leading scalar name is unchanged.
+
+A `BIG_DECIMAL` value sent as a JSON number rather than a string is read
+without float rounding. A value that cannot be decoded as its declared type
+raises `pinotdb.exceptions.DataError`.
+
+Boolean connection options (`use_multistage_engine`, `preserve_types`,
+`debug`) accept booleans or the strings `true`/`false`, `1`/`0`, `yes`/`no`,
+`on`/`off`, as they arrive from URL query strings; other values raise
+`InterfaceError` instead of being treated as enabled.
+
 For the opt-in live regression, see
 [the fixture instructions](tests/integration/fixtures/result_types/README.md).
 

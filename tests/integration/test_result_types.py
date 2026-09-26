@@ -87,3 +87,78 @@ def test_exact_values_and_native_nulls(engine, schema, column_name, expected):
     assert [type(v) for v in actual] == [type(v) for v in expected]
     if column_name == 'amount':
         assert actual[0].as_tuple() == expected[0].as_tuple()
+
+
+@pytest.fixture(params=['use_multistage_engine=true', 'multistage-dialect'])
+def multistage_engine(request):
+    host = os.getenv('PINOT_HOST', 'localhost')
+    broker = os.getenv('PINOT_BROKER_PORT', '8000')
+    controller = os.getenv('PINOT_CONTROLLER_PORT', '9000')
+    query = (f'?controller=http://{host}:{controller}/'
+             '&query_options=enableNullHandling%3Dtrue')
+    if request.param == 'multistage-dialect':
+        from sqlalchemy.dialects import registry
+        registry.register('pinot.multistage', 'pinotdb.sqlalchemy',
+                          'PinotMultiStageDialect')
+        url = f'pinot+multistage://{host}:{broker}/query/sql{query}'
+    else:
+        url = f'pinot://{host}:{broker}/query/sql{query}&{request.param}'
+    value = create_engine(url)
+    try:
+        yield value
+    finally:
+        value.dispose()
+
+
+@pytest.mark.parametrize('column_name,expected', [
+    ('amount', [
+        Decimal('123456789012345678901234567890.12345678901234567890'),
+        None, Decimal('-0.00000000000000000001'),
+    ]),
+    ('payload', [b'\x00\xff\x80A', None, b'']),
+    ('tags', [['SJC', 'ABQ'], ['null-row'], ['empty-bytes']]),
+    ('numbers', [[1, 2], [0], [-1]]),
+])
+def test_multistage_engine_values(multistage_engine, column_name, expected):
+    table = Table('resultTypes', MetaData(), autoload_with=multistage_engine)
+    # A self-join is rejected by the single-stage engine, so rows prove the
+    # multi-stage engine served the query.
+    other = table.alias('other')
+    statement = (
+        select(table.c[column_name])
+        .join(other, table.c.id == other.c.id)
+        .order_by(table.c.id).limit(3)
+    )
+    with multistage_engine.connect() as connection:
+        actual = connection.execute(statement).scalars().all()
+    assert actual == expected
+    assert [type(v) for v in actual] == [type(v) for v in expected]
+    if column_name == 'amount':
+        assert actual[0].as_tuple() == expected[0].as_tuple()
+
+
+def test_single_stage_rejects_the_join_used_as_multistage_proof(engine):
+    table = Table('resultTypes', MetaData(), autoload_with=engine)
+    other = table.alias('other')
+    statement = select(table.c.id).join(other, table.c.id == other.c.id)
+    with engine.connect() as connection, pytest.raises(Exception):
+        connection.execute(statement).all()
+
+
+def test_false_multistage_option_stays_single_stage(engine):
+    url = engine.url.update_query_dict({'use_multistage_engine': 'false'})
+    single = create_engine(url)
+    try:
+        test_single_stage_rejects_the_join_used_as_multistage_proof(single)
+    finally:
+        single.dispose()
+
+
+def test_reflected_types_render_names(engine):
+    table = Table('resultTypes', MetaData(), autoload_with=engine)
+    rendered = {c.name: c.type.compile(dialect=engine.dialect)
+                for c in table.columns}
+    assert rendered['payload'] == 'BYTES'
+    assert rendered['tags'] == 'VARCHAR ARRAY'
+    assert rendered['numbers'] == 'NUMERIC ARRAY'
+    assert rendered['amount'] == 'NUMERIC'

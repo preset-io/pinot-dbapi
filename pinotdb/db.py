@@ -36,6 +36,30 @@ class Type(Enum):
     BINARY = 6
 
 
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off", ""})
+
+
+def as_bool(value, name):
+    """Read a boolean option that may arrive as a URL or JSON string.
+
+    ``bool("false")`` is True, so string values are parsed explicitly and
+    anything unrecognized is rejected rather than silently enabled.
+    """
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise exceptions.InterfaceError(
+        f"Invalid boolean value for {name}: {value!r}")
+
+
 def connect(*args, **kwargs):
     """
     Constructor for creating a connection to the database.
@@ -164,11 +188,14 @@ class Connection:
     """Connection to a Pinot database."""
 
     def __init__(self, *args, **kwargs):
-        self._debug = kwargs.get("debug", False)
+        self._debug = as_bool(kwargs.get("debug", False), "debug")
         self._args = args
         self._kwargs = kwargs
         self.closed = False
-        self.use_multistage_engine = kwargs.get('use_multistage_engine', False)
+        self.use_multistage_engine = as_bool(
+            kwargs.get('use_multistage_engine', False),
+            'use_multistage_engine',
+        )
         self.query_options = kwargs.get('query_options', None)
         self.cursors = []
         self.session = kwargs.get('session')
@@ -295,8 +322,28 @@ def convert_result_if_required(data_types, rows):
         if t.needs_conversion:
             for row in rows:
                 if row[i] is not None:
-                    row[i] = convert_result(t, row[i])
+                    try:
+                        row[i] = convert_result(t, row[i])
+                    except (ValueError, TypeError, ArithmeticError) as e:
+                        # PEP 249: invalid values from the server are data
+                        # errors, not bare Python exceptions.
+                        raise exceptions.DataError(
+                            f"Cannot convert column {i} value {row[i]!r} "
+                            f"as {t.code.name}: {e}"
+                        ) from e
     return rows
+
+
+def _to_decimal(value):
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str) or (
+        isinstance(value, int) and not isinstance(value, bool)
+    ):
+        return Decimal(value)
+    # A JSON float has already been rounded to binary floating point; the
+    # response parser keeps such values as exact Decimal text instead.
+    raise TypeError(f"expected a decimal string, got {type(value).__name__}")
 
 
 def convert_result(data_type, raw_row):
@@ -307,9 +354,13 @@ def convert_result(data_type, raw_row):
         return [convert_result(scalar_type, value) for value in raw_row]
     if data_type.code == Type.NUMBER:
         # BIG_DECIMAL is a decimal string, not a JSON-encoded string or float.
-        return Decimal(raw_row)
+        return _to_decimal(raw_row)
     elif data_type.code == Type.BINARY:
         # The broker serializes BYTES as hexadecimal, not text bytes.
+        if not isinstance(raw_row, str):
+            raise TypeError(
+                f"expected a hexadecimal string, got {type(raw_row).__name__}"
+            )
         return bytes.fromhex(raw_row)
     elif data_type.code == Type.TIMESTAMP:
         # Pinot returns TIMESTAMP as STRING
@@ -319,6 +370,46 @@ def convert_result(data_type, raw_row):
         return json.loads(raw_row) if raw_row != '' else None
     else:
         return json.dumps(raw_row)
+
+
+def _contains_float(value):
+    if isinstance(value, list):
+        return any(_contains_float(item) for item in value)
+    return isinstance(value, float)
+
+
+def _decimals_to_floats(value):
+    if isinstance(value, list):
+        return [_decimals_to_floats(item) for item in value]
+    return float(value) if isinstance(value, Decimal) else value
+
+
+def preserve_exact_decimals(column_data_types, rows, response_text):
+    """Re-read JSON numbers in BIG_DECIMAL columns without float rounding.
+
+    Pinot serializes BIG_DECIMAL as a string, but a number is valid JSON and
+    the default parser would silently round it to a binary float. Only when
+    that happens is the response parsed again with exact decimals; every other
+    column keeps the float the default parser produced.
+    """
+    decimal_columns = {
+        i for i, column_data_type in enumerate(column_data_types)
+        if column_data_type in ("BIG_DECIMAL", "BIG_DECIMAL_ARRAY")
+    }
+    if not decimal_columns or not any(
+        _contains_float(row[i]) for row in rows for i in decimal_columns
+    ):
+        return rows
+    exact_rows = json.loads(
+        response_text, parse_float=Decimal
+    )["resultTable"]["rows"]
+    return [
+        [
+            value if i in decimal_columns else _decimals_to_floats(value)
+            for i, value in enumerate(row)
+        ]
+        for row in exact_rows
+    ]
 
 
 class Cursor:
@@ -367,9 +458,10 @@ class Cursor:
         self.raw_query_response = None
         self.query_stats = {}
         self.timeUsedMs = -1
-        self._debug = debug
-        self._preserve_types = preserve_types
-        self._use_multistage_engine = use_multistage_engine
+        self._debug = as_bool(debug, "debug")
+        self._preserve_types = as_bool(preserve_types, "preserve_types")
+        self._use_multistage_engine = as_bool(
+            use_multistage_engine, "use_multistage_engine")
         self._query_options = query_options
         self.acceptable_respond_fraction = acceptable_respond_fraction
         if ignore_exception_error_codes:
@@ -508,7 +600,8 @@ class Cursor:
             column_data_types = data_schema.get("columnDataTypes")
             values = results.get("rows")
             if column_names:
-                rows = values
+                rows = preserve_exact_decimals(
+                    column_data_types, values, query_response.text)
             else:
                 raise exceptions.DatabaseError(
                     "Expected columns and results in resultTable, "

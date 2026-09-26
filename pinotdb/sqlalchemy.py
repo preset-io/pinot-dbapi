@@ -135,6 +135,14 @@ class PinotTypeCompiler(compiler.GenericTypeCompiler):
         return "BYTES"
 
     visit_VARBINARY = visit_BINARY
+    # Reflected BYTES columns are LargeBinary; STRUCT/MAP stay BLOB and
+    # remain unsupported.
+    visit_large_binary = visit_BINARY
+
+    def visit_ARRAY(self, type_, **kwargs):
+        # Multi-value columns: SQL-standard "<item type> ARRAY" spelling,
+        # so type names start with the item type they already had.
+        return f"{self.process(type_.item_type, **kwargs)} ARRAY"
 
     def visit_DATETIME(self, type_, **kwargs):
         return "TIMESTAMP"
@@ -421,7 +429,8 @@ class PinotDialect(default.DefaultDialect):
             kwargs["password"] = self._password = kwargs.pop("password")
         if "database" in kwargs:
             kwargs["database"] = self._database = kwargs.pop("database")
-        kwargs["debug"] = self._debug = bool(kwargs.get("debug", False))
+        kwargs["debug"] = self._debug = pinotdb.db.as_bool(
+            kwargs.get("debug", False), "debug")
         kwargs["verify_ssl"] = self._verify_ssl = (
             str(kwargs.get("verify_ssl", "true")).lower() in ['true']
         )

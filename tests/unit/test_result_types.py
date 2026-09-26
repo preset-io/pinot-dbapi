@@ -1,11 +1,15 @@
 """Broker wire types and reflected SQLAlchemy result processors agree."""
+import json
 from decimal import Decimal
+from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from sqlalchemy import types
 
+from pinotdb import exceptions
 from pinotdb.db import (
-    convert_result_if_required, get_types_from_column_data_types,
+    Cursor, convert_result_if_required, get_types_from_column_data_types,
 )
 from pinotdb.sqlalchemy import PinotDialect
 
@@ -46,11 +50,63 @@ def test_bytes_wire_and_binary(value):
 
 
 @pytest.mark.parametrize('wire_type,value', [
-    ('BIG_DECIMAL', 'invalid'), ('BYTES', 'zz'), ('BYTES', 'f'),
+    ('BIG_DECIMAL', 'invalid'), ('BIG_DECIMAL', True), ('BIG_DECIMAL', {}),
+    ('BIG_DECIMAL_ARRAY', ['1', 'x']),
+    ('BYTES', 'zz'), ('BYTES', 'f'), ('BYTES', 12), ('BYTES_ARRAY', ['0g']),
+    ('TIMESTAMP', 'not a timestamp'), ('JSON', '{broken'),
 ])
-def test_invalid_wire_values_are_not_hidden(wire_type, value):
-    with pytest.raises((ValueError, ArithmeticError)):
+def test_invalid_wire_values_raise_data_error(wire_type, value):
+    # PEP 249: undecodable server values surface as DatabaseError subclasses
+    # that callers catching the DBAPI hierarchy can handle.
+    with pytest.raises(exceptions.DataError) as info:
         decode(wire_type, value)
+    assert isinstance(info.value, exceptions.DatabaseError)
+    assert info.value.__cause__ is not None
+
+
+def query(payload_text):
+    cursor = Cursor(host='localhost', session=MagicMock(spec=httpx.Client))
+    response = httpx.Response(200, content=payload_text.encode())
+    return cursor.normalize_query_response('SELECT 1', response)
+
+
+def payload(column_types, rows_json):
+    names = json.dumps([f'c{i}' for i in range(len(column_types))])
+    return (
+        '{"resultTable": {"dataSchema": {"columnNames": ' + names
+        + ', "columnDataTypes": ' + json.dumps(column_types) + '}, '
+        '"rows": ' + rows_json + '}, "exceptions": [], '
+        '"numServersQueried": 1, "numServersResponded": 1, '
+        '"timeUsedMs": 1.5}'
+    )
+
+
+def test_big_decimal_json_number_keeps_exact_digits():
+    # A JSON number must not be routed through float: this one has more
+    # significant digits than a double can hold.
+    cursor = query(payload(
+        ['BIG_DECIMAL', 'DOUBLE', 'BIG_DECIMAL_ARRAY', 'DOUBLE_ARRAY', 'INT'],
+        '[[12345678901234567890.123456789, 0.1, [1.10, "2.5", 3], '
+        '[0.1, 2.5], 7]]',
+    ))
+    row = cursor.fetchall()[0]
+    assert row[0] == Decimal('12345678901234567890.123456789')
+    assert row[0].as_tuple() == Decimal(
+        '12345678901234567890.123456789').as_tuple()
+    assert row[2] == [Decimal('1.10'), Decimal('2.5'), Decimal(3)]
+    assert row[2][0].as_tuple() == Decimal('1.10').as_tuple()
+    # Other columns keep the default parser's plain floats and ints.
+    assert row[1] == 0.1 and type(row[1]) is float
+    assert row[3] == [0.1, 2.5] and all(type(v) is float for v in row[3])
+    assert row[4] == 7 and type(row[4]) is int
+    assert cursor.query_stats['timeUsedMs'] == 1.5
+    assert type(cursor.query_stats['timeUsedMs']) is float
+
+
+def test_big_decimal_strings_are_not_reparsed():
+    cursor = query(payload(
+        ['BIG_DECIMAL', 'DOUBLE'], '[["1.000000000000000000001", 0.5]]'))
+    assert cursor.fetchall() == [[Decimal('1.000000000000000000001'), 0.5]]
 
 
 def test_numeric_float_behavior_unchanged_and_asdecimal_false():
@@ -110,3 +166,43 @@ def test_array_tuple_option():
     assert process(array, [1.25, None]) == (
         Decimal('1.2500000000'), None,
     )
+
+
+@pytest.mark.parametrize('type_,expected', [
+    (types.ARRAY(types.String, dimensions=1), 'VARCHAR ARRAY'),
+    (types.ARRAY(types.BigInteger, dimensions=1), 'NUMERIC ARRAY'),
+    (types.ARRAY(types.Numeric, dimensions=1), 'NUMERIC ARRAY'),
+    (types.ARRAY(types.LargeBinary, dimensions=1), 'BYTES ARRAY'),
+    (types.LargeBinary(), 'BYTES'),
+])
+def test_reflected_types_have_names(type_, expected):
+    # Callers such as BI tools render reflected column types to text; an
+    # unrenderable type loses the column type entirely.
+    assert type_.compile(dialect=PinotDialect()) == expected
+
+
+def test_every_reflected_scalar_and_multi_value_type_renders(monkeypatch):
+    dialect = PinotDialect()
+    wire_types = ['INT', 'LONG', 'FLOAT', 'DOUBLE', 'BIG_DECIMAL', 'BOOLEAN',
+                  'TIMESTAMP', 'STRING', 'BYTES']
+    specs = [{'name': f'sv_{t}', 'dataType': t} for t in wire_types] + [
+        {'name': f'mv_{t}', 'dataType': t, 'singleValueField': False}
+        for t in wire_types if t not in ('BIG_DECIMAL', 'BYTES')
+    ]
+    monkeypatch.setattr(dialect, 'get_metadata_from_controller',
+                        lambda path: {'dimensionFieldSpecs': specs})
+    # Inspector.get_columns instantiates type classes the same way.
+    rendered = {
+        c['name']: (c['type']() if isinstance(c['type'], type)
+                    else c['type']).compile(dialect=dialect)
+        for c in dialect.get_columns(None, 'fixture')
+    }
+    assert rendered['sv_BYTES'] == 'BYTES'
+    for name, value in rendered.items():
+        if name.startswith('mv_'):
+            assert value == rendered[name.replace('mv_', 'sv_')] + ' ARRAY'
+
+
+def test_struct_and_map_remain_unsupported():
+    with pytest.raises(exceptions.NotSupportedError):
+        types.BLOB().compile(dialect=PinotDialect())
