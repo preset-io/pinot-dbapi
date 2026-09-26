@@ -129,7 +129,7 @@ def test_numeric_float_behavior_unchanged_and_asdecimal_false():
 ])
 def test_multi_value_reflection(monkeypatch, wire_type, item_type, value):
     dialect = PinotDialect()
-    monkeypatch.setattr(dialect, 'get_metadata_from_controller', lambda path: {
+    metadata = {
         'dimensionFieldSpecs': [
             {'name': 'multi', 'dataType': wire_type,
              'singleValueField': False},
@@ -137,7 +137,9 @@ def test_multi_value_reflection(monkeypatch, wire_type, item_type, value):
             {'name': 'explicit', 'dataType': wire_type,
              'singleValueField': True},
         ],
-    })
+    }
+    monkeypatch.setattr(dialect, 'get_metadata_from_controller',
+                        lambda path, **kw: metadata)
     columns = dialect.get_columns(None, 'fixture')
     array = columns[0]['type']
     assert isinstance(array, types.ARRAY)
@@ -191,7 +193,7 @@ def test_every_reflected_scalar_and_multi_value_type_renders(monkeypatch):
         for t in wire_types if t not in ('BIG_DECIMAL', 'BYTES')
     ]
     monkeypatch.setattr(dialect, 'get_metadata_from_controller',
-                        lambda path: {'dimensionFieldSpecs': specs})
+                        lambda path, **kw: {'dimensionFieldSpecs': specs})
     # Inspector.get_columns instantiates type classes the same way.
     rendered = {
         c['name']: (c['type']() if isinstance(c['type'], type)

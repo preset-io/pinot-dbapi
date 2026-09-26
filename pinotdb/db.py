@@ -647,19 +647,19 @@ class Cursor:
         query = self.finalize_query_payload(
             operation, parameters, queryOptions)
 
-        correlation_id = str(uuid.uuid4())
+        headers = request_headers(kwargs.pop("database", None))
         if self.auth and self.auth._username and self.auth._password:
             r = self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 auth=(self.auth._username, self.auth._password),
                 **kwargs)
         else:
             r = self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 **kwargs)
 
         return self.normalize_query_response(query, r)
@@ -751,19 +751,19 @@ class AsyncCursor(Cursor):
         query = self.finalize_query_payload(
             operation, parameters, queryOptions)
 
-        correlation_id = str(uuid.uuid4())
+        headers = request_headers(kwargs.pop("database", None))
         if self.auth and self.auth._username and self.auth._password:
             r = await self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 auth=(self.auth._username, self.auth._password),
                 **kwargs)
         else:
             r = await self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 **kwargs)
 
         return self.normalize_query_response(query, r)
@@ -773,6 +773,15 @@ class AsyncCursor(Cursor):
         """Close the cursor."""
         await self.session.aclose()
         self.closed = True
+
+
+def request_headers(database=None):
+    """Per-request headers; ``database`` routes one query to that Pinot
+    logical database, overriding the connection's ``database`` option."""
+    headers = {"X-Correlation-Id": str(uuid.uuid4())}
+    if database is not None:
+        headers["database"] = str(database)
+    return headers
 
 
 def apply_parameters(operation, parameters):

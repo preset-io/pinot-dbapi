@@ -263,6 +263,20 @@ pinot+http://pinot-broker:8099/query/sql?controller=http://pinot-controller:9000
 where `dbName` is the database context that needs to be passed.
 If not specified the connection will use the `default` database context while querying.
 
+Setting `database` is an explicit single-database mode: schema listing
+returns only that database. Without it, Pinot logical databases act as
+SQLAlchemy schemas:
+- `get_schema_names()` lists them from the controller's `/databases`
+  (`['default']` on servers without that endpoint);
+- `get_table_names`, `get_columns` and `has_table` with `schema='db2'` query
+  that database;
+- a `Table(..., schema='db2')` compiles as `db2.table` (columns stay
+  `table.column`), and the statement is sent with a `Database: db2` header,
+  which the multi-stage engine requires.
+
+Tables in the connection's own database (`default`, or the `database` option)
+stay unqualified. A single statement cannot mix databases.
+
 ## Examples with Pinot Quickstart
 
 Start Pinot Batch Quickstart

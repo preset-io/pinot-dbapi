@@ -219,9 +219,15 @@ class PinotDialectTest(PinotTestCase):
         with self.assertRaises(exceptions.DatabaseError):
             self.dialect.get_metadata_from_controller('some-path')
 
+    @responses.activate
     def test_gets_schema_names(self):
+        url = f'{self.dialect._controller}/databases'
+        responses.get(url, status=404, json={'code': 404})
         names = self.dialect.get_schema_names('some connection')
         self.assertEqual(names, ['default'])
+        responses.replace(responses.GET, url, json=['zeta', 'default', 'db2'])
+        names = self.dialect.get_schema_names('some connection')
+        self.assertEqual(names, ['default', 'db2', 'zeta'])
         self.dialect._database = 'foo'
         names = self.dialect.get_schema_names('some connection')
         self.assertEqual(names, ['foo'])

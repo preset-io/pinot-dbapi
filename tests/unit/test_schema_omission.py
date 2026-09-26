@@ -1,4 +1,5 @@
-"""Synthetic reflection schemas must not become Pinot SQL qualifiers."""
+"""The default database renders unqualified; other logical databases
+are qualified on the table only."""
 import pytest
 from sqlalchemy import Column, Integer, MetaData, Table, select
 from sqlalchemy.schema import CreateTable
@@ -21,16 +22,21 @@ def events(schema):
 
 
 @pytest.mark.parametrize('dialect_cls', DIALECTS)
-@pytest.mark.parametrize('schema', [None, 'default', 'analytics'])
-def test_select_omits_schema_without_changing_metadata(dialect_cls, schema):
+@pytest.mark.parametrize('schema,prefix', [
+    (None, ''), ('default', ''), ('analytics', 'analytics.'),
+])
+def test_select_omits_schema_without_changing_metadata(
+    dialect_cls, schema, prefix,
+):
     dialect = dialect_cls(paramstyle="pyformat")
     table = events(schema)
     statement = (select(table.c.event_count)
                  .where(table.c.event_count > 7)
                  .order_by(table.c.event_count).limit(3).offset(2))
     compiled = statement.compile(dialect=dialect)
+    # Columns are never database-qualified: Pinot rejects "db"."t".column.
     assert str(compiled) == (
-        'SELECT "EventData".event_count \nFROM "EventData" \n'
+        f'SELECT "EventData".event_count \nFROM {prefix}"EventData" \n'
         'WHERE "EventData".event_count > %(event_count_1)s '
         'ORDER BY "EventData".event_count\n'
         ' LIMIT %(param_1)s OFFSET %(param_2)s'
@@ -63,17 +69,25 @@ def test_explicit_aliases_and_subqueries_are_preserved(shape):
     assert 'default' not in sql
 
 
-@pytest.mark.parametrize('schema', [None, 'default'])
-@pytest.mark.parametrize('mapping', [
-    {'default': 'other'}, {'default': None}, {None: 'other'},
+@pytest.mark.parametrize('schema,mapping,prefix', [
+    ('default', {'default': 'other'}, 'other.'),
+    ('default', {'default': None}, ''),
+    (None, {None: 'other'}, 'other.'),
+    (None, {'default': 'other'}, ''),
+    ('alias', {'alias': 'default'}, ''),
+    ('alias', {'alias': None}, ''),
 ])
-def test_schema_translation_cannot_reintroduce_qualifiers(schema, mapping):
+def test_schema_translation_resolves_to_the_target_database(
+    schema, mapping, prefix,
+):
     table = events(schema)
-    sql = str(select(table.c.event_count).compile(
+    compiled = select(table.c.event_count).compile(
         dialect=ps.PinotHTTPDialect(), schema_translate_map=mapping,
         render_schema_translate=True,
-    ))
-    assert sql == 'SELECT "EventData".event_count \nFROM "EventData"'
+    )
+    assert str(compiled) == (
+        f'SELECT "EventData".event_count \nFROM {prefix}"EventData"')
+    assert compiled.pinot_database == (prefix[:-1] or None)
     assert table.schema == schema
 
 
