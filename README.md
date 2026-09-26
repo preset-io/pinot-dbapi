@@ -23,6 +23,11 @@ by ` ARRAY` (for example `VARCHAR ARRAY`, `NUMERIC ARRAY`). Tools that store
 reflected type names will see this suffix on multi-value columns where they
 previously saw only the scalar name; the leading scalar name is unchanged.
 
+Binary parameters (`bytes`, or `pinotdb.Binary(...)`) and SQLAlchemy
+`LargeBinary` literals or binds (bytes or hexadecimal text) render as
+`hexToBytes('<hex>')`, which both the single-stage and multi-stage engines
+accept when comparing with a `BYTES` column.
+
 A `BIG_DECIMAL` value sent as a JSON number rather than a string is read
 without float rounding. A value that cannot be decoded as its declared type
 raises `pinotdb.exceptions.DataError`.

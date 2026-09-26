@@ -777,8 +777,26 @@ def apply_parameters(operation, parameters):
     return escaped_operation % escaped_parameters
 
 
+def Binary(value):
+    """PEP 249 constructor for a binary (BYTES) parameter."""
+    return bytes(value)
+
+
+def binary_literal(value) -> str:
+    """Render bytes as a Pinot BYTES expression.
+
+    Neither quoted form works on both engines: the single-stage engine
+    compares a BYTES column with a '<hex>' string (and silently matches
+    nothing for X'<hex>'), while the multi-stage engine rejects '<hex>' and
+    requires X'<hex>'. hexToBytes('<hex>') is accepted by both.
+    """
+    return "hexToBytes('{}')".format(bytes(value).hex())
+
+
 def escape_parameter(value: Any) -> Any:
-    if value == "*":
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return binary_literal(value)
+    elif value == "*":
         return value
     elif isinstance(value, str):
         return "'{}'".format(value.replace("'", "''"))

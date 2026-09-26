@@ -9,7 +9,8 @@ from sqlalchemy import types
 
 from pinotdb import exceptions
 from pinotdb.db import (
-    Cursor, convert_result_if_required, get_types_from_column_data_types,
+    Cursor, apply_parameters, convert_result_if_required,
+    get_types_from_column_data_types,
 )
 from pinotdb.sqlalchemy import PinotDialect
 
@@ -206,3 +207,68 @@ def test_every_reflected_scalar_and_multi_value_type_renders(monkeypatch):
 def test_struct_and_map_remain_unsupported():
     with pytest.raises(exceptions.NotSupportedError):
         types.BLOB().compile(dialect=PinotDialect())
+
+
+@pytest.mark.parametrize('value,expected', [
+    (b'\x00\xff\x80A', "hexToBytes('00ff8041')"),
+    (bytearray(b'\x01'), "hexToBytes('01')"),
+    (memoryview(b''), "hexToBytes('')"),
+])
+def test_bytes_parameters_render_as_pinot_bytes(value, expected):
+    # Previously interpolated as a Python repr such as b'\x00...'.
+    assert apply_parameters(
+        'SELECT id FROM t WHERE payload = %(p)s', {'p': value},
+    ) == f'SELECT id FROM t WHERE payload = {expected}'
+
+
+def test_pep249_binary_constructor():
+    import pinotdb
+    assert pinotdb.Binary(b'\x00A') == b'\x00A'
+    assert apply_parameters('%(p)s', {'p': pinotdb.Binary(b'\x00')}) == (
+        "hexToBytes('00')")
+
+
+def binary_statement(value, operator='eq'):
+    from sqlalchemy import column, select, table
+    t = table('resultTypes', column('id'),
+              column('payload', types.LargeBinary()))
+    condition = (t.c.payload.in_(value) if operator == 'in'
+                 else t.c.payload == value)
+    return select(t.c.id).where(condition)
+
+
+@pytest.mark.parametrize('value', [b'\x00\xff\x80A', '00ff8041', '00FF8041'])
+def test_binary_literal_binds(value):
+    sql = str(binary_statement(value).compile(
+        dialect=PinotDialect(), compile_kwargs={'literal_binds': True}))
+    assert sql.endswith("payload = hexToBytes('00ff8041')")
+
+
+def test_binary_literal_in_list_and_invalid_hex():
+    sql = str(binary_statement(['00ff8041', ''], 'in').compile(
+        dialect=PinotDialect(), compile_kwargs={'literal_binds': True}))
+    assert sql.endswith(
+        "payload IN (hexToBytes('00ff8041'), hexToBytes(''))")
+    with pytest.raises(Exception):
+        str(binary_statement('zz').compile(
+            dialect=PinotDialect(), compile_kwargs={'literal_binds': True}))
+
+
+@pytest.mark.parametrize('value', [b'\x00\xff\x80A', '00ff8041'])
+def test_binary_bind_parameter_reaches_broker_as_bytes(value):
+    from sqlalchemy import create_engine
+    engine = create_engine(
+        'pinot://localhost:8000/query/sql?controller=http://localhost:9000/')
+    sent = []
+
+    def fake_execute(self, operation, parameters=None, *args, **kwargs):
+        sent.append(apply_parameters(operation, parameters or {}))
+        self.description = [('id', None, None, None, None, None, None)]
+        self._results = []
+        return self
+
+    import unittest.mock as mock
+    with mock.patch.object(Cursor, 'execute', fake_execute):
+        with engine.connect() as connection:
+            connection.execute(binary_statement(value)).all()
+    assert sent[0].endswith("payload = hexToBytes('00ff8041')")

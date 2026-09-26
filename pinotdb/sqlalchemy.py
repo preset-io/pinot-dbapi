@@ -37,6 +37,27 @@ class PinotNumeric(types.Numeric):
         return process
 
 
+def _binary_value(value):
+    if isinstance(value, str):
+        # Hex text, as the broker returns it and as BI tools display it.
+        return bytes.fromhex(value)
+    return bytes(value)
+
+
+class PinotLargeBinary(types.LargeBinary):
+    def bind_processor(self, dialect):
+        def process(value):
+            return None if value is None else _binary_value(value)
+
+        return process
+
+    def literal_processor(self, dialect):
+        def process(value):
+            return pinotdb.db.binary_literal(_binary_value(value))
+
+        return process
+
+
 class PinotArray(types.ARRAY):
     def result_processor(self, dialect, coltype):
         item_processor = self.item_type.dialect_impl(dialect).result_processor(
@@ -388,7 +409,11 @@ class PinotDialect(default.DefaultDialect):
     preparer = PinotIdentifierPareparer
     statement_compiler = PinotCompiler
     type_compiler = PinotTypeCompiler
-    colspecs = {types.Numeric: PinotNumeric, types.ARRAY: PinotArray}
+    colspecs = {
+        types.Numeric: PinotNumeric,
+        types.ARRAY: PinotArray,
+        types.LargeBinary: PinotLargeBinary,
+    }
     supports_schemas = False
     supports_statement_cache = False
     supports_alter = False

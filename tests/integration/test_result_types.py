@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 import requests
-from sqlalchemy import MetaData, Table, create_engine, select, types
+from sqlalchemy import MetaData, Table, create_engine, select, text, types
 
 
 pytestmark = pytest.mark.skipif(
@@ -162,3 +162,23 @@ def test_reflected_types_render_names(engine):
     assert rendered['tags'] == 'VARCHAR ARRAY'
     assert rendered['numbers'] == 'NUMERIC ARRAY'
     assert rendered['amount'] == 'NUMERIC'
+
+
+@pytest.mark.parametrize('value', [b'\x00\xff\x80A', '00ff8041'])
+@pytest.mark.parametrize('literal', [False, True])
+def test_binary_filter_matches_on_both_engines(
+    engine, multistage_engine, value, literal,
+):
+    for current in (engine, multistage_engine):
+        table = Table('resultTypes', MetaData(), autoload_with=current)
+        statement = select(table.c.id).where(table.c.payload == value)
+        if literal:
+            statement = text(str(statement.compile(
+                current, compile_kwargs={'literal_binds': True})))
+        with current.connect() as connection:
+            assert connection.execute(statement).scalars().all() == [1]
+        in_statement = select(table.c.id).where(
+            table.c.payload.in_([value, b''])).order_by(table.c.id)
+        with current.connect() as connection:
+            # Row 2's null is stored as the '' default, which IN matches.
+            assert 1 in connection.execute(in_statement).scalars().all()
