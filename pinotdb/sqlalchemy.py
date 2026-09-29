@@ -292,7 +292,6 @@ def extract_table_name(fqn):
     return fqn if len(split) == 1 else split[1]
 
 
-
 class PinotAsyncAdaptDBAPIModule:
     def __init__(self, dbapi_module):
         self._dbapi_module = dbapi_module
@@ -516,15 +515,16 @@ class PinotDialect(default.DefaultDialect):
             kwargs["database"] = self._database = kwargs.pop("database")
         kwargs["debug"] = self._debug = pinotdb.db.as_bool(
             kwargs.get("debug", False), "debug")
-        kwargs["verify_ssl"] = self._verify_ssl = pinotdb.db.as_bool(
-            kwargs.get("verify_ssl", True), "verify_ssl")
+        kwargs["verify_ssl"] = self._verify_ssl = pinotdb.db.verify_option(
+            kwargs.get("verify_ssl", True))
         kwargs["timeout"] = self._timeout = (
             float(kwargs.get('timeout'))
             if kwargs.get('timeout')
             else None
         )
         logger.info(
-            "Updated pinot dialect options: debug=%s, verify_ssl=%s, timeout=%s, database_set=%s",
+            "Updated pinot dialect options: debug=%s, verify_ssl=%s, "
+            "timeout=%s, database_set=%s",
             self._debug,
             self._verify_ssl,
             self._timeout,
@@ -555,7 +555,7 @@ class PinotDialect(default.DefaultDialect):
             "scheme": self.scheme,
             "username": url.username,
             "password": url.password,
-            "verify_ssl": self._verify_ssl or True,
+            "verify_ssl": self._verify_ssl,
             "timeout": float(self._timeout) if self._timeout else 10.0,
         }
         if self.engine_type == "multi_stage":

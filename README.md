@@ -38,7 +38,8 @@ Boolean connection options (`use_multistage_engine`, `preserve_types`,
 raise `InterfaceError` instead of being treated as enabled. This is stricter
 than 9.1.2.2: values such as `'t'`, `'y'` or `1.0`, which used to count as
 true, are now rejected, and `verify_ssl=1`/`verify_ssl=yes` keep TLS
-verification on (they used to turn it off).
+verification on (they used to turn it off). `verify_ssl` is parsed the same way
+by `pinotdb.connect()` and may also be the path of a CA bundle.
 
 For the opt-in live regression, see
 [the fixture instructions](tests/integration/fixtures/result_types/README.md).

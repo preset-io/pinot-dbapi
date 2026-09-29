@@ -6,6 +6,8 @@ from typing import Any
 import ciso8601
 import json
 import logging
+import os
+import ssl
 import uuid
 from collections import namedtuple
 from enum import Enum
@@ -58,6 +60,24 @@ def as_bool(value, name):
             return False
     raise exceptions.InterfaceError(
         f"Invalid boolean value for {name}: {value!r}")
+
+
+def verify_option(value):
+    """Read ``verify_ssl``: a boolean option that may also name a CA bundle.
+
+    Verification stays on when the option is unset. A string that is neither
+    a boolean nor an existing path is rejected, so it can never turn TLS
+    verification off.
+    """
+    if value is None:
+        return True
+    if isinstance(value, ssl.SSLContext):
+        return value
+    if isinstance(value, str) and value.strip().lower() not in (
+        _TRUE_STRINGS | _FALSE_STRINGS
+    ) and os.path.exists(value):
+        return value
+    return as_bool(value, "verify_ssl")
 
 
 def connect(*args, **kwargs):
@@ -235,7 +255,7 @@ class Connection:
         """Return a new Cursor Object using the connection."""
         if not self.session or self.session.is_closed:
             self.session = httpx.Client(
-                verify=self._kwargs.get('verify_ssl'),
+                verify=verify_option(self._kwargs.get('verify_ssl')),
                 timeout=(
                     float(self._kwargs.get('timeout'))
                     if self._kwargs.get('timeout')
@@ -272,7 +292,7 @@ class AsyncConnection(Connection):
         """Return a new Cursor Object using the connection."""
         if not self.session or self.session.is_closed:
             self.session = httpx.AsyncClient(
-                verify=self._kwargs.get('verify_ssl'),
+                verify=verify_option(self._kwargs.get('verify_ssl')),
                 timeout=(
                     float(self._kwargs.get('timeout'))
                     if self._kwargs.get('timeout')

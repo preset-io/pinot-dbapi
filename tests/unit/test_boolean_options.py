@@ -55,6 +55,43 @@ def test_verify_ssl_defaults_on_and_rejects_unknown_values():
         PinotDialect(verify_ssl='maybe')
 
 
+def test_dialect_verify_ssl_false_reaches_connect_args():
+    dialect = PinotDialect(verify_ssl=False)
+    _, kwargs = dialect.create_connect_args(
+        make_url('pinot://localhost:8000/'))
+    assert kwargs['verify_ssl'] is False
+
+
+def test_verify_ssl_accepts_a_ca_bundle_path(tmp_path):
+    bundle = tmp_path / 'ca.pem'
+    bundle.write_text('')
+    assert PinotDialect(verify_ssl=str(bundle))._verify_ssl == str(bundle)
+
+
+@pytest.mark.parametrize('value,expected', [
+    (None, True), ('true', True), ('1', True), ('yes', True), (True, True),
+    ('false', False), ('0', False), ('no', False), (False, False),
+])
+def test_dbapi_verify_ssl_is_parsed_before_reaching_httpx(
+        monkeypatch, value, expected):
+    seen = {}
+    real_client = httpx.Client
+
+    def recording_client(*args, verify=True, **kwargs):
+        seen['verify'] = verify
+        return real_client(*args, verify=verify, **kwargs)
+
+    monkeypatch.setattr(httpx, 'Client', recording_client)
+    options = {} if value is None else {'verify_ssl': value}
+    connect(host='localhost', **options).cursor()
+    assert seen['verify'] is expected
+
+
+def test_dbapi_verify_ssl_rejects_unknown_values():
+    with pytest.raises(exceptions.InterfaceError):
+        connect(host='localhost', verify_ssl='maybe').cursor()
+
+
 @pytest.mark.parametrize('value,expected', [
     ('false', {'sql': 'SELECT 1'}),
     ('true', {'sql': 'SELECT 1',
