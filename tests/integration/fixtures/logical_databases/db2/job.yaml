@@ -1,0 +1,24 @@
+executionFrameworkSpec:
+  name: standalone
+  segmentGenerationJobRunnerClassName: org.apache.pinot.plugin.ingestion.batch.standalone.SegmentGenerationJobRunner
+  segmentTarPushJobRunnerClassName: org.apache.pinot.plugin.ingestion.batch.standalone.SegmentTarPushJobRunner
+jobType: SegmentCreationAndTarPush
+inputDirURI: /tmp/logical-databases/db2/data
+includeFileNamePattern: 'glob:**/*.json'
+outputDirURI: /tmp/logical-databases/db2/segments
+overwriteOutput: true
+pinotFSSpecs:
+  - scheme: file
+    className: org.apache.pinot.spi.filesystem.LocalPinotFS
+recordReaderSpec:
+  dataFormat: json
+  className: org.apache.pinot.plugin.inputformat.json.JSONRecordReader
+tableSpec:
+  tableName: db2.rt
+  schemaURI: http://localhost:9000/tables/db2.rt/schema
+  tableConfigURI: http://localhost:9000/tables/db2.rt
+pinotClusterSpecs:
+  - controllerURI: http://localhost:9000
+pushJobSpec:
+  pushAttempts: 2
+  pushRetryIntervalMillis: 1000

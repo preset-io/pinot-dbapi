@@ -17,6 +17,30 @@ SQLAlchemy reflection represents `singleValueField: false` as a one-dimensional
 `ARRAY` with its scalar item type. Reflected decimal results do not pass through
 float conversion; `Numeric(asdecimal=False)` explicitly requests floats.
 
+Reflected types render as text through the dialect's type compiler: `BYTES`
+columns as `BYTES`, and multi-value columns as their scalar type name followed
+by ` ARRAY` (for example `VARCHAR ARRAY`, `NUMERIC ARRAY`). Tools that store
+reflected type names will see this suffix on multi-value columns where they
+previously saw only the scalar name; the leading scalar name is unchanged.
+
+Binary parameters (`bytes`, or `pinotdb.Binary(...)`) and SQLAlchemy
+`LargeBinary` literals or binds (bytes or hexadecimal text) render as
+`hexToBytes('<hex>')`, which both the single-stage and multi-stage engines
+accept when comparing with a `BYTES` column.
+
+A `BIG_DECIMAL` value sent as a JSON number rather than a string is read
+without float rounding. A value that cannot be decoded as its declared type
+raises `pinotdb.exceptions.DataError`.
+
+Boolean connection options (`use_multistage_engine`, `preserve_types`,
+`debug`, `verify_ssl`) accept booleans or the strings `true`/`false`, `1`/`0`,
+`yes`/`no`, `on`/`off`, as they arrive from URL query strings; other values
+raise `InterfaceError` instead of being treated as enabled. This is stricter
+than 9.1.2.2: values such as `'t'`, `'y'` or `1.0`, which used to count as
+true, are now rejected, and `verify_ssl=1`/`verify_ssl=yes` keep TLS
+verification on (they used to turn it off). `verify_ssl` is parsed the same way
+by `pinotdb.connect()` and may also be the path of a CA bundle.
+
 For the opt-in live regression, see
 [the fixture instructions](tests/integration/fixtures/result_types/README.md).
 
@@ -242,6 +266,23 @@ pinot+http://pinot-broker:8099/query/sql?controller=http://pinot-controller:9000
 
 where `dbName` is the database context that needs to be passed.
 If not specified the connection will use the `default` database context while querying.
+
+Setting `database` is an explicit single-database mode: schema listing
+returns only that database. Without it, Pinot logical databases act as
+SQLAlchemy schemas:
+- `get_schema_names()` lists them from the controller's `/databases`; it
+  returns `['default']`, as before, when no controller is configured, the
+  server has no such endpoint, the credentials may not list databases, or
+  the controller cannot be reached;
+- `get_table_names`, `get_columns` and `has_table` with `schema='db2'` query
+  that database;
+- a `Table(..., schema='db2')` compiles as `db2.table` (columns stay
+  `table.column`), and the statement is sent with a `Database: db2` header,
+  which the multi-stage engine requires.
+
+Tables in the connection's own database (`default`, or the `database` option)
+stay unqualified. A single statement cannot mix databases: compiling one
+that does raises `CompileError`.
 
 ## Examples with Pinot Quickstart
 

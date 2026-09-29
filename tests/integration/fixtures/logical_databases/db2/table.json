@@ -1,0 +1,1 @@
+{"tableName": "db2.rt", "tableType": "OFFLINE", "segmentsConfig": {"replication": "1", "schemaName": "db2.rt"}, "tenants": {"broker": "DefaultTenant", "server": "DefaultTenant"}, "tableIndexConfig": {"loadMode": "MMAP", "nullHandlingEnabled": true}, "metadata": {}}

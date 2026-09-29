@@ -1,4 +1,6 @@
 import collections
+import copy
+import types as types_module
 from decimal import Decimal
 import sys
 from urllib import parse
@@ -9,6 +11,7 @@ from sqlalchemy.engine import default
 from sqlalchemy.engine.interfaces import AdaptedConnection
 from sqlalchemy.sql import compiler
 from sqlalchemy import pool, types
+from sqlalchemy.exc import CompileError, NoSuchTableError
 from sqlalchemy.util.concurrency import await_only
 
 import pinotdb
@@ -37,6 +40,27 @@ class PinotNumeric(types.Numeric):
         return process
 
 
+def _binary_value(value):
+    if isinstance(value, str):
+        # Hex text, as the broker returns it and as BI tools display it.
+        return bytes.fromhex(value)
+    return pinotdb.db.Binary(value)
+
+
+class PinotLargeBinary(types.LargeBinary):
+    def bind_processor(self, dialect):
+        def process(value):
+            return None if value is None else _binary_value(value)
+
+        return process
+
+    def literal_processor(self, dialect):
+        def process(value):
+            return pinotdb.db.binary_literal(_binary_value(value))
+
+        return process
+
+
 class PinotArray(types.ARRAY):
     def result_processor(self, dialect, coltype):
         item_processor = self.item_type.dialect_impl(dialect).result_processor(
@@ -54,12 +78,39 @@ class PinotArray(types.ARRAY):
 
 
 class PinotCompiler(compiler.SQLCompiler):
+    def __init__(self, *args, **kwargs):
+        # Pinot logical databases referenced by this statement's tables;
+        # None stands for the connection's own database.
+        self.pinot_databases = set()
+        super().__init__(*args, **kwargs)
+        preparer = copy.copy(self.preparer)
+        if "schema_for_object" in preparer.__dict__:
+            preparer.schema_for_object = types_module.MethodType(
+                type(preparer).schema_for_object, preparer)
+        self.preparer = preparer
+
+    @property
+    def pinot_database(self):
+        """The one other logical database this statement targets, if any.
+
+        The multi-stage engine resolves a table only in the database named by
+        the request's Database header, so such statements are routed there.
+        """
+        if len(self.pinot_databases) == 1:
+            return next(iter(self.pinot_databases))
+        return None
+
     def visit_select(self, select, **kwargs):
         return super().visit_select(select, **kwargs)
 
     def visit_table(self, table, **kwargs):
         if self.preparer.omit_schema:
             kwargs["ambiguous_table_name_map"] = None
+            self.pinot_databases.add(self.preparer.pinot_database_for(table))
+            if len(self.pinot_databases) > 1:
+                raise CompileError(
+                    "A Pinot statement cannot reference tables in more than "
+                    "one logical database")
         return super().visit_table(table, **kwargs)
 
     def visit_column(self, column, result_map=None, **kwargs):
@@ -70,7 +121,15 @@ class PinotCompiler(compiler.SQLCompiler):
         result_map = result_map or kwargs.pop("add_to_result_map", None)
         # This is a hack to modify the original column, but how do I clone it ?
         column.is_literal = True
-        return super().visit_column(column, result_map, **kwargs)
+        # Columns stay table-qualified only: a database-qualified FROM
+        # (db.table) resolves "table".column on both engines.
+        preparer = self.preparer
+        suppress = getattr(preparer, "_pinot_columns", False)
+        preparer._pinot_columns = True
+        try:
+            return super().visit_column(column, result_map, **kwargs)
+        finally:
+            preparer._pinot_columns = suppress
 
     def visit_function(self, func, **kw):
         if func.name and func.name.lower() == "count":
@@ -135,6 +194,14 @@ class PinotTypeCompiler(compiler.GenericTypeCompiler):
         return "BYTES"
 
     visit_VARBINARY = visit_BINARY
+    # Reflected BYTES columns are LargeBinary; STRUCT/MAP stay BLOB and
+    # remain unsupported.
+    visit_large_binary = visit_BINARY
+
+    def visit_ARRAY(self, type_, **kwargs):
+        # Multi-value columns: SQL-standard "<item type> ARRAY" spelling,
+        # so type names start with the item type they already had.
+        return f"{self.process(type_.item_type, **kwargs)} ARRAY"
 
     def visit_DATETIME(self, type_, **kwargs):
         return "TIMESTAMP"
@@ -178,27 +245,51 @@ class PinotIdentifierPareparer(compiler.IdentifierPreparer):
             omit_schema=omit_schema,
         )
 
+    def pinot_database_for(self, obj):
+        """Logical database of a table, or None for the connection's own.
+
+        Table.schema names a Pinot logical database. The default database
+        (or the one set with the ``database`` option) renders unqualified,
+        as before; any other renders as ``database.table``.
+        """
+        schema = getattr(obj, "schema", None)
+        translate = getattr(self, "_pinot_schema_translate_map", None)
+        if (
+            translate
+            and getattr(obj, "_use_schema_map", False)
+            and schema in translate
+        ):
+            schema = translate[schema]
+        return self.dialect.pinot_database_for_schema(schema)
+
     def schema_for_object(self, obj):
         # SELECT table/column visitors use this hook directly, bypassing
         # format_table() and its omit_schema check. Keep Table.schema intact
-        # for reflection; Pinot's database context comes from the connection.
+        # for reflection. Only a database other than the connection's own is
+        # rendered, and never on column references.
         if self.omit_schema:
-            return None
+            if getattr(self, "_pinot_columns", False):
+                return None
+            return self.pinot_database_for(obj)
         return super().schema_for_object(obj)
 
     def _with_schema_translate(self, schema_translate_map):
-        # SQLAlchemy replaces schema_for_object on translated preparers. A
-        # translation must not reintroduce schemas when they are omitted.
+        # SQLAlchemy replaces schema_for_object on translated preparers with
+        # placeholder tokens; resolve the translation here instead.
         preparer = super()._with_schema_translate(schema_translate_map)
         if self.omit_schema:
-            preparer.schema_for_object = self.schema_for_object
+            preparer._pinot_schema_translate_map = dict(schema_translate_map)
+            preparer.schema_for_object = types_module.MethodType(
+                type(preparer).schema_for_object, preparer)
         return preparer
+
+
+_CONNECTION_DATABASE = object()
 
 
 def extract_table_name(fqn):
     split = fqn.split(".", 2)
     return fqn if len(split) == 1 else split[1]
-
 
 
 class PinotAsyncAdaptDBAPIModule:
@@ -312,12 +403,9 @@ class PinotAsyncAdaptCursor:
         except Exception as error:
             self._adapt_connection._handle_exception(error)
 
-    def execute(self, operation, parameters=None):
+    def execute(self, operation, parameters=None, **kwargs):
         try:
-            if parameters is None:
-                await_only(self._cursor.execute(operation))
-            else:
-                await_only(self._cursor.execute(operation, parameters))
+            await_only(self._cursor.execute(operation, parameters, **kwargs))
 
             self._description = self._cursor.description
             self._rowcount = self._cursor.rowcount
@@ -380,7 +468,11 @@ class PinotDialect(default.DefaultDialect):
     preparer = PinotIdentifierPareparer
     statement_compiler = PinotCompiler
     type_compiler = PinotTypeCompiler
-    colspecs = {types.Numeric: PinotNumeric, types.ARRAY: PinotArray}
+    colspecs = {
+        types.Numeric: PinotNumeric,
+        types.ARRAY: PinotArray,
+        types.LargeBinary: PinotLargeBinary,
+    }
     supports_schemas = False
     supports_statement_cache = False
     supports_alter = False
@@ -421,17 +513,18 @@ class PinotDialect(default.DefaultDialect):
             kwargs["password"] = self._password = kwargs.pop("password")
         if "database" in kwargs:
             kwargs["database"] = self._database = kwargs.pop("database")
-        kwargs["debug"] = self._debug = bool(kwargs.get("debug", False))
-        kwargs["verify_ssl"] = self._verify_ssl = (
-            str(kwargs.get("verify_ssl", "true")).lower() in ['true']
-        )
+        kwargs["debug"] = self._debug = pinotdb.db.as_bool(
+            kwargs.get("debug", False), "debug")
+        kwargs["verify_ssl"] = self._verify_ssl = pinotdb.db.verify_option(
+            kwargs.get("verify_ssl", True))
         kwargs["timeout"] = self._timeout = (
             float(kwargs.get('timeout'))
             if kwargs.get('timeout')
             else None
         )
         logger.info(
-            "Updated pinot dialect options: debug=%s, verify_ssl=%s, timeout=%s, database_set=%s",
+            "Updated pinot dialect options: debug=%s, verify_ssl=%s, "
+            "timeout=%s, database_set=%s",
             self._debug,
             self._verify_ssl,
             self._timeout,
@@ -462,7 +555,7 @@ class PinotDialect(default.DefaultDialect):
             "scheme": self.scheme,
             "username": url.username,
             "password": url.password,
-            "verify_ssl": self._verify_ssl or True,
+            "verify_ssl": self._verify_ssl,
             "timeout": float(self._timeout) if self._timeout else 10.0,
         }
         if self.engine_type == "multi_stage":
@@ -473,13 +566,33 @@ class PinotDialect(default.DefaultDialect):
         kwargs = self.update_from_kwargs(kwargs)
         return ([], kwargs)
 
-    def get_metadata_from_controller(self, path):
+    def pinot_database_for_schema(self, schema):
+        """Database to name explicitly for ``schema``; None means the
+        connection's own (the ``database`` option, else ``default``)."""
+        if schema is None:
+            return None
+        if self._database is not None:
+            return None if schema == self._database else schema
+        return None if schema == "default" else schema
+
+    def _metadata_database(self, schema):
+        if schema is None:
+            return self._database
+        if self._database is None and schema == "default":
+            return None
+        return schema
+
+    def get_metadata_from_controller(
+        self, path, database=_CONNECTION_DATABASE,
+    ):
         url = parse.urljoin(self._controller, path)
         headers = {"Accept": "application/json"}
-        # Only send Database header when explicitly set to a non-None value,
-        # always as a string; Requests rejects non-string header values.
-        if self._database is not None:
-            headers["Database"] = str(self._database)
+        if database is _CONNECTION_DATABASE:
+            database = self._database
+        # Only send Database header when set to a non-None value, always as
+        # a string; Requests rejects non-string header values.
+        if database is not None:
+            headers["Database"] = str(database)
 
         # Only send basic auth when credentials are provided; passing None here
         # triggers deprecation warnings in Requests.
@@ -495,6 +608,18 @@ class PinotDialect(default.DefaultDialect):
             verify=self._verify_ssl,
             auth=auth,
         )
+        if r.status_code in (401, 403):
+            raise exceptions.OperationalError(
+                f"Pinot controller rejected the credentials for {path}: "
+                f"HTTP {r.status_code}"
+            )
+        if r.status_code >= 400:
+            error = exceptions.DatabaseError(
+                f"Pinot controller returned HTTP {r.status_code} for "
+                f"{path}: {r.text}"
+            )
+            error.status_code = r.status_code
+            raise error
         try:
             result = r.json()
         except ValueError as e:
@@ -513,16 +638,39 @@ class PinotDialect(default.DefaultDialect):
         return result
 
     def get_schema_names(self, connection, **kwargs):
+        # The database option is an explicit single-database mode.
         if self._database:
             return [self._database]
-        else:
+        # Listing databases is best effort: without a controller, on servers
+        # before logical databases (no /databases endpoint), for principals
+        # without cluster-level database access, or when the controller cannot
+        # be reached, fall back to the default database, as before logical
+        # database support. A malformed 200 response still raises.
+        if not self._controller:
             return ['default']
+        try:
+            databases = self.get_metadata_from_controller(
+                "/databases", database=None)
+        except (exceptions.DatabaseError,
+                requests.exceptions.RequestException) as e:
+            logger.warning(
+                "Could not list Pinot databases from the controller, "
+                "listing only 'default': %s", e)
+            return ['default']
+        if not isinstance(databases, list) or not all(
+            isinstance(name, str) for name in databases
+        ):
+            raise exceptions.DatabaseError(
+                f"Unexpected /databases response: {databases!r}")
+        names = sorted(set(databases) - {'default'})
+        return ['default'] + names
 
     def has_table(self, connection, table_name, schema=None, **kwargs):
         return table_name in self.get_table_names(connection, schema)
 
     def get_table_names(self, connection, schema=None, **kwargs):
-        resp = self.get_metadata_from_controller("/tables")
+        resp = self.get_metadata_from_controller(
+            "/tables", database=self._metadata_database(schema))
         if 'tables' in resp:
             return list(map(extract_table_name, resp["tables"]))
         else:
@@ -535,9 +683,15 @@ class PinotDialect(default.DefaultDialect):
         return {}
 
     def get_columns(self, connection, table_name, schema=None, **kwargs):
-        payload = self.get_metadata_from_controller(
-            f"/tables/{table_name}/schema"
-        )
+        try:
+            payload = self.get_metadata_from_controller(
+                f"/tables/{table_name}/schema",
+                database=self._metadata_database(schema),
+            )
+        except exceptions.DatabaseError as e:
+            if getattr(e, "status_code", None) == 404:
+                raise NoSuchTableError(table_name) from e
+            raise
 
         logger.info(
             "Getting columns for %s from %s: %s",
@@ -604,6 +758,18 @@ class PinotDialect(default.DefaultDialect):
 
     def do_rollback(self, dbapi_connection):
         pass
+
+    @staticmethod
+    def _routing(context):
+        compiled = getattr(context, "compiled", None)
+        database = getattr(compiled, "pinot_database", None)
+        return {} if database is None else {"database": database}
+
+    def do_execute(self, cursor, statement, parameters, context=None):
+        cursor.execute(statement, parameters, **self._routing(context))
+
+    def do_execute_no_params(self, cursor, statement, context=None):
+        cursor.execute(statement, **self._routing(context))
 
     def _check_unicode_returns(self, connection, additional_tests=None):
         return True

@@ -1,4 +1,4 @@
-from pinotdb.db import connect, connect_async
+from pinotdb.db import Binary, connect, connect_async
 from pinotdb.exceptions import (
     DataError,
     DatabaseError,
@@ -14,6 +14,7 @@ from pinotdb.exceptions import (
 
 
 __all__ = [
+    "Binary",
     "connect",
     "connect_async",
     "apilevel",

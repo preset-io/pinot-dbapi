@@ -6,6 +6,8 @@ from typing import Any
 import ciso8601
 import json
 import logging
+import os
+import ssl
 import uuid
 from collections import namedtuple
 from enum import Enum
@@ -34,6 +36,48 @@ class Type(Enum):
     TIMESTAMP = 4
     JSON = 5
     BINARY = 6
+
+
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off", ""})
+
+
+def as_bool(value, name):
+    """Read a boolean option that may arrive as a URL or JSON string.
+
+    ``bool("false")`` is True, so string values are parsed explicitly and
+    anything unrecognized is rejected rather than silently enabled.
+    """
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise exceptions.InterfaceError(
+        f"Invalid boolean value for {name}: {value!r}")
+
+
+def verify_option(value):
+    """Read ``verify_ssl``: a boolean option that may also name a CA bundle.
+
+    Verification stays on when the option is unset. A string that is neither
+    a boolean nor an existing path is rejected, so it can never turn TLS
+    verification off.
+    """
+    if value is None:
+        return True
+    if isinstance(value, ssl.SSLContext):
+        return value
+    if isinstance(value, str) and value.strip().lower() not in (
+        _TRUE_STRINGS | _FALSE_STRINGS
+    ) and os.path.exists(value):
+        return value
+    return as_bool(value, "verify_ssl")
 
 
 def connect(*args, **kwargs):
@@ -164,11 +208,14 @@ class Connection:
     """Connection to a Pinot database."""
 
     def __init__(self, *args, **kwargs):
-        self._debug = kwargs.get("debug", False)
+        self._debug = as_bool(kwargs.get("debug", False), "debug")
         self._args = args
         self._kwargs = kwargs
         self.closed = False
-        self.use_multistage_engine = kwargs.get('use_multistage_engine', False)
+        self.use_multistage_engine = as_bool(
+            kwargs.get('use_multistage_engine', False),
+            'use_multistage_engine',
+        )
         self.query_options = kwargs.get('query_options', None)
         self.cursors = []
         self.session = kwargs.get('session')
@@ -208,7 +255,7 @@ class Connection:
         """Return a new Cursor Object using the connection."""
         if not self.session or self.session.is_closed:
             self.session = httpx.Client(
-                verify=self._kwargs.get('verify_ssl'),
+                verify=verify_option(self._kwargs.get('verify_ssl')),
                 timeout=(
                     float(self._kwargs.get('timeout'))
                     if self._kwargs.get('timeout')
@@ -245,7 +292,7 @@ class AsyncConnection(Connection):
         """Return a new Cursor Object using the connection."""
         if not self.session or self.session.is_closed:
             self.session = httpx.AsyncClient(
-                verify=self._kwargs.get('verify_ssl'),
+                verify=verify_option(self._kwargs.get('verify_ssl')),
                 timeout=(
                     float(self._kwargs.get('timeout'))
                     if self._kwargs.get('timeout')
@@ -295,8 +342,28 @@ def convert_result_if_required(data_types, rows):
         if t.needs_conversion:
             for row in rows:
                 if row[i] is not None:
-                    row[i] = convert_result(t, row[i])
+                    try:
+                        row[i] = convert_result(t, row[i])
+                    except (ValueError, TypeError, ArithmeticError) as e:
+                        # PEP 249: invalid values from the server are data
+                        # errors, not bare Python exceptions.
+                        raise exceptions.DataError(
+                            f"Cannot convert column {i} value {row[i]!r} "
+                            f"as {t.code.name}: {e}"
+                        ) from e
     return rows
+
+
+def _to_decimal(value):
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str) or (
+        isinstance(value, int) and not isinstance(value, bool)
+    ):
+        return Decimal(value)
+    # A JSON float has already been rounded to binary floating point; the
+    # response parser keeps such values as exact Decimal text instead.
+    raise TypeError(f"expected a decimal string, got {type(value).__name__}")
 
 
 def convert_result(data_type, raw_row):
@@ -307,9 +374,13 @@ def convert_result(data_type, raw_row):
         return [convert_result(scalar_type, value) for value in raw_row]
     if data_type.code == Type.NUMBER:
         # BIG_DECIMAL is a decimal string, not a JSON-encoded string or float.
-        return Decimal(raw_row)
+        return _to_decimal(raw_row)
     elif data_type.code == Type.BINARY:
         # The broker serializes BYTES as hexadecimal, not text bytes.
+        if not isinstance(raw_row, str):
+            raise TypeError(
+                f"expected a hexadecimal string, got {type(raw_row).__name__}"
+            )
         return bytes.fromhex(raw_row)
     elif data_type.code == Type.TIMESTAMP:
         # Pinot returns TIMESTAMP as STRING
@@ -319,6 +390,48 @@ def convert_result(data_type, raw_row):
         return json.loads(raw_row) if raw_row != '' else None
     else:
         return json.dumps(raw_row)
+
+
+def _contains_float(value):
+    if isinstance(value, list):
+        return any(_contains_float(item) for item in value)
+    return isinstance(value, float)
+
+
+def _decimals_to_floats(value):
+    if isinstance(value, list):
+        return [_decimals_to_floats(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _decimals_to_floats(item) for key, item in value.items()}
+    return float(value) if isinstance(value, Decimal) else value
+
+
+def preserve_exact_decimals(column_data_types, rows, response_text):
+    """Re-read JSON numbers in BIG_DECIMAL columns without float rounding.
+
+    Pinot serializes BIG_DECIMAL as a string, but a number is valid JSON and
+    the default parser would silently round it to a binary float. Only when
+    that happens is the response parsed again with exact decimals; every other
+    column keeps the float the default parser produced.
+    """
+    decimal_columns = {
+        i for i, column_data_type in enumerate(column_data_types)
+        if column_data_type in ("BIG_DECIMAL", "BIG_DECIMAL_ARRAY")
+    }
+    if not decimal_columns or not any(
+        _contains_float(row[i]) for row in rows for i in decimal_columns
+    ):
+        return rows
+    exact_rows = json.loads(
+        response_text, parse_float=Decimal
+    )["resultTable"]["rows"]
+    return [
+        [
+            value if i in decimal_columns else _decimals_to_floats(value)
+            for i, value in enumerate(row)
+        ]
+        for row in exact_rows
+    ]
 
 
 class Cursor:
@@ -367,9 +480,10 @@ class Cursor:
         self.raw_query_response = None
         self.query_stats = {}
         self.timeUsedMs = -1
-        self._debug = debug
-        self._preserve_types = preserve_types
-        self._use_multistage_engine = use_multistage_engine
+        self._debug = as_bool(debug, "debug")
+        self._preserve_types = as_bool(preserve_types, "preserve_types")
+        self._use_multistage_engine = as_bool(
+            use_multistage_engine, "use_multistage_engine")
         self._query_options = query_options
         self.acceptable_respond_fraction = acceptable_respond_fraction
         if ignore_exception_error_codes:
@@ -445,6 +559,19 @@ class Cursor:
             return {"sql": query}
 
     def normalize_query_response(self, input_query, query_response):
+        if query_response.status_code in (401, 403):
+            # Checked before parsing: a proxy in front of the broker may
+            # answer with an empty or HTML body.
+            self.raw_query_response = {
+                "response": query_response.text,
+                "status_code": query_response.status_code,
+            }
+            raise exceptions.OperationalError(
+                "Pinot broker rejected the request credentials. "
+                f"Query\n\n{input_query}\n\nreturned an error: "
+                f"{query_response.status_code}\n"
+                f"Full response is {query_response.text}")
+
         try:
             payload = query_response.json()
             self.raw_query_response = {
@@ -469,6 +596,16 @@ class Cursor:
                 f"with the status code {status_code}:\n{payload}"
             )
 
+        # Raise HTTP errors before reading query stats: an error response
+        # carries no server counts, which would otherwise be misreported as
+        # a timeout.
+        if query_response.status_code != 200:
+            msg = (
+                f"Query\n\n{input_query}\n\nreturned an error: "
+                f"{query_response.status_code}\n"
+                f"Full response is {pformat(payload)}")
+            raise exceptions.ProgrammingError(msg)
+
         self.query_stats = get_query_stats(payload)
         num_servers_responded = self.query_stats.get("numServersResponded", -1)
         num_servers_queried = self.query_stats.get("numServersQueried", -1)
@@ -477,14 +614,6 @@ class Cursor:
         self.check_sufficient_responded(
             input_query, num_servers_queried, num_servers_responded
         )
-
-        # raise any error messages
-        if query_response.status_code != 200:
-            msg = (
-                f"Query\n\n{input_query}\n\nreturned an error: "
-                f"{query_response.status_code}\n"
-                f"Full response is {pformat(payload)}")
-            raise exceptions.ProgrammingError(msg)
 
         query_exceptions = [
             e for e in payload.get("exceptions", [])
@@ -508,7 +637,8 @@ class Cursor:
             column_data_types = data_schema.get("columnDataTypes")
             values = results.get("rows")
             if column_names:
-                rows = values
+                rows = preserve_exact_decimals(
+                    column_data_types, values, query_response.text)
             else:
                 raise exceptions.DatabaseError(
                     "Expected columns and results in resultTable, "
@@ -549,19 +679,19 @@ class Cursor:
         query = self.finalize_query_payload(
             operation, parameters, queryOptions)
 
-        correlation_id = str(uuid.uuid4())
+        headers = request_headers(kwargs.pop("database", None))
         if self.auth and self.auth._username and self.auth._password:
             r = self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 auth=(self.auth._username, self.auth._password),
                 **kwargs)
         else:
             r = self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 **kwargs)
 
         return self.normalize_query_response(query, r)
@@ -653,19 +783,19 @@ class AsyncCursor(Cursor):
         query = self.finalize_query_payload(
             operation, parameters, queryOptions)
 
-        correlation_id = str(uuid.uuid4())
+        headers = request_headers(kwargs.pop("database", None))
         if self.auth and self.auth._username and self.auth._password:
             r = await self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 auth=(self.auth._username, self.auth._password),
                 **kwargs)
         else:
             r = await self.session.post(
                 self.url,
                 json=query,
-                headers={"X-Correlation-Id": correlation_id},
+                headers=headers,
                 **kwargs)
 
         return self.normalize_query_response(query, r)
@@ -677,6 +807,15 @@ class AsyncCursor(Cursor):
         self.closed = True
 
 
+def request_headers(database=None):
+    """Per-request headers; ``database`` routes one query to that Pinot
+    logical database, overriding the connection's ``database`` option."""
+    headers = {"X-Correlation-Id": str(uuid.uuid4())}
+    if database is not None:
+        headers["database"] = str(database)
+    return headers
+
+
 def apply_parameters(operation, parameters):
     escaped_parameters = {
         key: escape_parameter(value) for key, value in parameters.items()}
@@ -684,8 +823,29 @@ def apply_parameters(operation, parameters):
     return escaped_operation % escaped_parameters
 
 
+def Binary(value):
+    """PEP 249 constructor for a binary (BYTES) parameter."""
+    # bytes(3) would silently be three zero bytes.
+    if isinstance(value, int):
+        raise TypeError(f"Binary() needs a bytes-like value, not {value!r}")
+    return bytes(value)
+
+
+def binary_literal(value) -> str:
+    """Render bytes as a Pinot BYTES expression.
+
+    Neither quoted form works on both engines: the single-stage engine
+    compares a BYTES column with a '<hex>' string (and silently matches
+    nothing for X'<hex>'), while the multi-stage engine rejects '<hex>' and
+    requires X'<hex>'. hexToBytes('<hex>') is accepted by both.
+    """
+    return "hexToBytes('{}')".format(bytes(value).hex())
+
+
 def escape_parameter(value: Any) -> Any:
-    if value == "*":
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return binary_literal(value)
+    elif value == "*":
         return value
     elif isinstance(value, str):
         return "'{}'".format(value.replace("'", "''"))
